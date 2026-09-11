@@ -1,0 +1,75 @@
+[project]
+name = "vela"
+version = "0.1.0"
+description = "Options and equity backtesting engine."
+readme = "README.md"
+requires-python = ">=3.12"
+# antlia is the only source of market data -- vela never talks to a vendor.
+# The `store` extra is what a read needs (duckdb + pyarrow); `thetadata` is
+# only needed on a machine that *warms* the cache, so it stays optional.
+dependencies = [
+    "antlia[store]",
+    "numpy>=2",
+    "pyarrow>=16",
+    "scipy>=1.14",
+    # An undeclared transitive need of antlia's `store` extra: duckdb requires
+    # pytz to turn a TIMESTAMP WITH TIME ZONE into a Python object, which is
+    # what `history.ingests()` does. Arrow reads never take that path, so the
+    # gap only appears when asking *which version of the data* a run read --
+    # which is exactly what provenance needs. Declared here until antlia does.
+    "pytz>=2024.1",
+]
+
+# The one command vela ships. A backtest is something you run from a shell or
+# a launch configuration; warming the cache is antlia's `antlia-history`.
+[project.scripts]
+vela = "vela.run.cli:main"
+
+[project.optional-dependencies]
+# For warming the cache from this repo (`antlia-history fill ...`).
+ingest = ["antlia[store,thetadata]"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+ "ruff>=0.6",
+ "mypy>=1.11",
+ "scipy-stubs>=1.14",
+]
+
+[tool.uv.sources]
+antlia = { path = "/home/neroo/repo/antlia" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vela"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["antlia.*", "pyarrow.*", "duckdb.*"]
+ignore_missing_imports = true
+
+# Strict is for the code that ships. Annotating every test function proves
+# nothing and makes the tests worse to read.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

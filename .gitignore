@@ -1,0 +1,28 @@
+# LLM instruction files -- local only, they record private research detail
+CLAUDE.md
+AGENTS.md
+.github/agents/
+.cursorrules
+
+# Local-only: launch configurations carry real symbols and tuned parameters
+.vscode/
+
+# Local-only: which warmed symbol and window the real-data tests read
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Run artifacts and private config
+runs/
+config/*.json
+!config/*.example.json
+settings.json
