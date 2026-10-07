@@ -318,6 +318,36 @@ class MarketView:
         )
 
 
+def data_failure(exc: BaseException) -> str | None:
+    """Which kind of data failure `exc` is, or None if it is not one.
+
+    Here rather than in a caller because this is the only module that may name
+    antlia's types. The kinds are what a driver does next, so they map to
+    distinct exit codes:
+
+    - ``"missing"`` -- the store does not hold the window, or cannot vouch
+      for it (`NotCovered`, `CoverageIncomplete`). Warm the cache.
+    - ``"denied"`` -- the vendor will never serve it (`NotEntitled`). Change
+      the window; filling again cannot help.
+    - ``"fetch"`` -- a fetch was attempted and failed (`IngestFailed`).
+      Transient until proven otherwise; retry.
+
+    Anything else -- including a bug in the read path -- is None, and should
+    surface as the crash it is rather than as advice to warm a cache.
+    """
+    from antlia.history.errors import IngestFailed, NotCovered, NotEntitled
+
+    from vela.data.guards import CoverageIncomplete
+
+    if isinstance(exc, NotCovered | CoverageIncomplete):
+        return "missing"
+    if isinstance(exc, NotEntitled):
+        return "denied"
+    if isinstance(exc, IngestFailed):
+        return "fetch"
+    return None
+
+
 def _read_version(
     symbol: str,
     *,

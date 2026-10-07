@@ -76,6 +76,20 @@ class Book:
         self.cash += exit_cash
         return position
 
+    def accrue(self, rate: float, days: int) -> float:
+        """Credit `days` of interest on the cash balance, returning the amount.
+
+        ACT/365, the year the pricing layer uses, simple over the gap and
+        credited every session so it compounds. Applied to the whole balance,
+        margin included: a broker pays on cash that backs a defined-risk
+        spread, because margin is a requirement, not a transfer. A negative
+        balance pays the same rate -- the sizing models never borrow, so a
+        debit here is a bug made visible rather than a financing assumption.
+        """
+        amount = self.cash * rate * days / 365.0
+        self.cash += amount
+        return amount
+
     def market_value(self, chain: ChainSnapshot, spot: float, fill: FillModel) -> float:
         return sum(
             p.market_value(chain, spot, fill, self.multiplier) for p in self._positions.values()

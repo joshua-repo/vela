@@ -219,3 +219,48 @@ def test_exercise_fees_land_only_on_settlement() -> None:
     # 2 contracts opened, plus the one in-the-money leg exercised
     assert trade.costs.commission == pytest.approx(3 * 0.65)
     assert trade.costs.spread == pytest.approx(40.0)
+
+
+# -- 6. interest on cash ------------------------------------------------------
+
+
+def test_interest_is_exactly_the_hand_calculation() -> None:
+    """ACT/365 over each calendar gap, credited per session so it compounds.
+
+    3.65% is 0.01% a day: one day, then a three-day weekend gap. Nothing
+    accrues on the first session -- the account is funded that day.
+    """
+    path = {dt.date(2026, 1, 8): 100.0, dt.date(2026, 1, 9): 100.0, dt.date(2026, 1, 12): 100.0}
+    result = BacktestEngine(cash_rate=0.0365).run(market(path), Scripted(lambda ctx: []))
+    expected = 100_000.0 * (1.0001 * 1.0003 - 1)
+    assert [p.interest for p in result.equity] == pytest.approx([0.0, 10.0, expected])
+    assert result.interest == pytest.approx(expected)
+    assert result.final_equity == pytest.approx(100_000.0 + expected)
+
+
+def test_cash_invariant_names_interest() -> None:
+    """Interest is the one movement no position explains, so the invariant
+    has to account for it -- every session, with positions open."""
+    path = {dt.date(2026, 1, 5) + dt.timedelta(days=i): 100.0 for i in range(10)}
+    path[EXPIRY] = 97.0
+
+    def script(ctx):
+        if len(ctx.book.positions) < 4 and ctx.day < EXPIRY:
+            return [Open(legs=(LegOrder(SHORT, -1), LegOrder(LONG, +1)), tag="ladder")]
+        return []
+
+    result = BacktestEngine(fill=TOUCH, cash_rate=0.05).run(spread_market(path), Scripted(script))
+    assert result.interest > 0
+    assert result.invariant_breaks() == []
+
+
+def test_interest_never_reaches_a_trade() -> None:
+    """A position's P&L is what the position did. The carry is account-level,
+    so the same trades come out at any rate."""
+
+    def run(rate: float):
+        return BacktestEngine(fill=TOUCH, cash_rate=rate).run(
+            spread_market(PATH), Scripted(enter_once)
+        )
+
+    assert [t.pnl for t in run(0.0).trades] == [t.pnl for t in run(0.05).trades]

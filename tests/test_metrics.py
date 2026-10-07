@@ -123,3 +123,33 @@ def test_a_flat_curve_has_no_sharpe_rather_than_a_huge_one() -> None:
 def test_a_curve_needs_two_points() -> None:
     with pytest.raises(ValueError, match="two points"):
         curve_stats(points([100.0]))
+
+
+def test_cash_alone_has_no_excess_and_no_sharpe() -> None:
+    """The benchmark accrues exactly as the engine credits: an account that
+    never trades matches it to rounding, and rounding is not a Sharpe ratio."""
+    from tests.conftest import Scripted, market
+    from vela.engine.loop import BacktestEngine
+
+    path = {dt.date(2026, 1, 5) + dt.timedelta(days=i): 100.0 for i in range(0, 30, 3)}
+    result = BacktestEngine(cash_rate=0.05).run(market(path), Scripted(lambda ctx: []))
+    stats = curve_stats(result.equity, initial=result.initial_cash, risk_free=0.05)
+    assert stats.total_return > 0
+    assert stats.risk_free_return == pytest.approx(stats.total_return, abs=1e-15)
+    assert stats.excess_return == pytest.approx(0.0, abs=1e-12)
+    assert math.isnan(stats.sharpe)
+
+
+def test_ratios_are_measured_against_cash() -> None:
+    """An account that only earns the coupon has a positive raw return and no
+    edge: against zero it would post a Sharpe made of the coupon alone."""
+    curve = points([100.0, 100.05, 100.15, 100.10, 100.25])
+    against_zero = curve_stats(curve, initial=100.0)
+    against_cash = curve_stats(curve, initial=100.0, risk_free=0.05)
+    assert against_cash.total_return == against_zero.total_return
+    assert against_cash.volatility == against_zero.volatility
+    assert against_cash.risk_free_return == pytest.approx((1 + 0.05 / 365) ** 4 - 1)
+    assert against_cash.excess_return == pytest.approx(
+        against_cash.total_return - against_cash.risk_free_return
+    )
+    assert against_cash.sharpe < against_zero.sharpe

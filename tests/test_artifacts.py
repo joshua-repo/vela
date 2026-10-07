@@ -132,6 +132,88 @@ def test_a_nested_component_records_its_parameters(run) -> None:
     assert record["strategy"]["params"]["gate"]["type"] == "IVRank"
 
 
+def test_the_regime_is_recorded_beside_the_result(run) -> None:
+    """First to last close. The fixture's path is flat, so the move is zero --
+    a recorded zero, not an absent field."""
+    result, mv, engine, strategy = run
+    record = summary(result, market=mv, engine=engine, strategy=strategy)
+    assert record["data"]["underlying_move"] == pytest.approx(0.0)
+
+
+def test_a_run_records_how_it_was_asked_for(run, tmp_path) -> None:
+    """Every parsed argument, defaults included: `--rate` or `--as-of` change a
+    result without appearing on any object the rest of the summary describes."""
+    from vela.run.cli import build_parser
+
+    result, mv, engine, strategy = run
+    argv = ["XYZ", "--start", "2020-01-02", "--end", "2020-12-31", "--iv-rank", "0.5"]
+    args = vars(build_parser().parse_args(argv))
+    out = write_run(
+        result,
+        tmp_path,
+        market=mv,
+        engine=engine,
+        strategy=strategy,
+        invocation={"argv": argv, "args": args},
+    )
+    record = strict((out / "summary.json").read_text())
+    assert record["invocation"]["argv"] == argv
+    assert record["invocation"]["args"]["iv_rank"] == 0.5
+    assert record["invocation"]["args"]["rate"] == 0.04
+    assert record["invocation"]["args"]["as_of"] is None
+
+
+def test_a_run_built_without_a_cli_has_no_invocation(run) -> None:
+    """Absent, not empty: nothing was invoked."""
+    result, mv, engine, strategy = run
+    assert "invocation" not in summary(result, market=mv, engine=engine, strategy=strategy)
+
+
+def test_parallel_runs_with_one_label_never_collide(run, tmp_path, monkeypatch) -> None:
+    """Cells of one combo finish in the same second under the same label. The
+    second must not crash after its compute is done -- it gets a suffix."""
+    from vela.run import artifacts
+
+    monkeypatch.setattr(artifacts, "_stamp", lambda: "20260101T000000Z")
+    result, mv, engine, strategy = run
+    outs = [
+        write_run(result, tmp_path, market=mv, engine=engine, strategy=strategy, label="cell")
+        for _ in range(3)
+    ]
+    assert [o.name for o in outs] == [
+        "20260101T000000Z_cell",
+        "20260101T000000Z_cell-1",
+        "20260101T000000Z_cell-2",
+    ]
+
+
+def test_provenance_is_vela_s_checkout_not_the_callers(run, tmp_path, monkeypatch) -> None:
+    """A driver launching cells from elsewhere must not stamp them with its
+    own commit, or with nothing."""
+    from vela.run.artifacts import _git
+
+    expected = _git()
+    monkeypatch.chdir(tmp_path)
+    assert _git() == expected
+
+
+def test_interest_is_recorded_and_measured_against(tmp_path) -> None:
+    mv = market(PATH, {d: chain(d, {EXPIRY: quotes(s)}) for d, s in PATH.items()})
+    strategy = Scripted(enter_once)
+    strategy.name = "Scripted"
+    engine = BacktestEngine(fill=FillModel(0.5, 0.65), margin=MaxLossMargin(), cash_rate=0.05)
+    result = engine.run(mv, strategy)
+    out = write_run(result, tmp_path, market=mv, engine=engine, strategy=strategy)
+    record = strict((out / "summary.json").read_text())
+    assert record["engine"]["cash_rate"] == 0.05
+    assert record["results"]["interest"] == pytest.approx(result.interest)
+    assert record["results"]["curve"]["risk_free"] == 0.05
+    assert record["results"]["curve"]["risk_free_return"] > 0
+    with (out / "equity.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert float(rows[-1]["interest"]) == pytest.approx(result.interest, abs=1e-4)
+
+
 # -- the command line ---------------------------------------------------------
 
 
@@ -140,7 +222,7 @@ def test_cli_refuses_an_uncached_symbol_and_says_what_to_run(capsys) -> None:
     from vela.run.cli import main
 
     code = main(["NOSUCHTICKER", "--start", "2026-01-01", "--end", "2026-02-01"])
-    assert code == 1
+    assert code == 3  # missing: warm the cache
     err = capsys.readouterr().err
     assert "antlia-history fill" in err
     assert "NOSUCHTICKER" in err
@@ -168,3 +250,124 @@ def test_cli_parses_the_documented_flags() -> None:
     assert args.iv_rank == 0.5
     assert args.haircut == 0.5  # costs are not free by default
     assert args.commission == 0.65
+
+
+def test_cash_rate_defaults_to_the_pricing_rate() -> None:
+    """One risk-free number unless told otherwise, resolved at parse time so
+    `invocation` records the rate that ran rather than None."""
+    from vela.run.cli import parse
+
+    base = ["XYZ", "--start", "2020-01-02", "--end", "2020-12-31"]
+    assert parse(base).cash_rate == 0.04
+    assert parse([*base, "--rate", "0.03"]).cash_rate == 0.03
+    assert parse([*base, "--rate", "0.03", "--cash-rate", "0"]).cash_rate == 0.0
+
+
+# -- one source of defaults ---------------------------------------------------
+
+
+def test_the_cli_and_a_bare_config_are_the_same_run() -> None:
+    """A combo cell built as `RunConfig(symbol, start, end)` must be exactly
+    what `vela SYMBOL --start --end` runs. Assembled separately, the library's
+    own structural defaults once ran 19 trades where the CLI ran 42."""
+    from vela.run.cli import config_from, parse
+    from vela.run.config import RunConfig
+
+    base = ["XYZ", "--start", "2020-01-02", "--end", "2020-12-31"]
+    assert config_from(parse(base)) == RunConfig("XYZ", "2020-01-02", "2020-12-31")
+
+
+def test_every_config_field_is_a_flag() -> None:
+    """A knob a combo can turn but `vela run` cannot is a cell no single run
+    can reproduce."""
+    from dataclasses import fields
+
+    from vela.run.cli import parse
+    from vela.run.config import RunConfig
+
+    args = vars(parse(["XYZ", "--start", "2020-01-02", "--end", "2020-12-31"]))
+    assert {f.name for f in fields(RunConfig)} <= set(args)
+
+
+def test_a_config_builds_a_fresh_strategy_every_time() -> None:
+    from vela.run.config import RunConfig
+
+    config = RunConfig("XYZ", "2020-01-02", "2020-12-31", iv_rank=0.5)
+    a, b = config.strategy(), config.strategy()
+    assert a is not b and a.gate is not b.gate
+
+
+# -- the runs root ------------------------------------------------------------
+
+
+def test_runs_land_in_a_fixed_root_not_the_cwd(monkeypatch, tmp_path) -> None:
+    """pictor reads one folder; it cannot follow a result to wherever the
+    runner happened to stand."""
+    from vela.run.artifacts import runs_root
+    from vela.run.cli import parse
+
+    base = ["XYZ", "--start", "2020-01-02", "--end", "2020-12-31"]
+    monkeypatch.delenv("VELA_RUNS")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert runs_root() == tmp_path / ".vela" / "runs"
+
+    monkeypatch.setenv("VELA_RUNS", "~/elsewhere")
+    assert runs_root() == tmp_path / "elsewhere"
+    assert parse(base).out == str(tmp_path / "elsewhere")  # recorded resolved
+    assert parse([*base, "--out", "mine"]).out == "mine"  # --out still wins
+
+
+# -- exit codes ---------------------------------------------------------------
+
+
+def test_data_failures_are_told_apart() -> None:
+    """What a driver does next differs for each, so each has its own code."""
+    from antlia.history.errors import IngestFailed, NotCovered, NotEntitled
+
+    from vela.data.guards import CoverageIncomplete
+    from vela.data.market import data_failure
+
+    assert data_failure(NotCovered("option_eod", "XYZ", [], "thetadata")) == "missing"
+    assert data_failure(CoverageIncomplete("stale listing")) == "missing"
+    assert data_failure(NotEntitled("thetadata", "before history begins")) == "denied"
+    assert data_failure(IngestFailed("thetadata", "malformed rows")) == "fetch"
+    assert data_failure(ValueError("a bug")) is None
+
+
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [("missing", 3), ("refused", 4), ("denied", 5), ("fetch", 6)],
+)
+def test_each_failure_has_its_own_exit_code(monkeypatch, raised, code) -> None:
+    from antlia.history.errors import IngestFailed, NotCovered, NotEntitled
+
+    from vela.data.guards import CorporateActionSuspected
+    from vela.run import config
+    from vela.run.cli import main
+
+    exc = {
+        "missing": NotCovered("option_eod", "XYZ", [], "thetadata"),
+        "refused": CorporateActionSuspected("a 10:1 split"),
+        "denied": NotEntitled("thetadata", "before history begins"),
+        "fetch": IngestFailed("thetadata", "malformed rows"),
+    }[raised]
+
+    def load(self):
+        raise exc
+
+    monkeypatch.setattr(config.RunConfig, "load", load)
+    assert main(["XYZ", "--start", "2020-01-02", "--end", "2020-12-31"]) == code
+
+
+def test_a_bug_in_the_read_path_crashes_rather_than_blaming_the_cache(monkeypatch) -> None:
+    """Previously every load exception printed "warm the cache" and exited 1,
+    indistinguishable from a cold store."""
+    from vela.run import config
+    from vela.run.cli import main
+
+    def load(self):
+        raise ZeroDivisionError("a bug")
+
+    monkeypatch.setattr(config.RunConfig, "load", load)
+    with pytest.raises(ZeroDivisionError):
+        main(["XYZ", "--start", "2020-01-02", "--end", "2020-12-31"])

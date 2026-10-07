@@ -31,6 +31,12 @@ from vela.pricing.enrich import Enricher
 from vela.strategy.base import Strategy
 
 
+@pytest.fixture(autouse=True)
+def _runs_root(tmp_path_factory, monkeypatch):
+    """No test writes into the real `~/.vela/runs` that pictor reads."""
+    monkeypatch.setenv("VELA_RUNS", str(tmp_path_factory.mktemp("runs")))
+
+
 def chain(
     day: dt.date,
     expirations: dict[dt.date, list[tuple[float, str, float, float]]],

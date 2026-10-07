@@ -18,12 +18,28 @@ Two defaults are opinionated, for reasons the project has measured:
   opposite conclusion.
 - **Costs are not zero.** The fill model crosses half a half-spread and charges
   a commission unless told otherwise; `--haircut 0` is a diagnostic.
+
+Every default comes from `vela.run.config.RunConfig`, so a run assembled any
+other way -- a combo cell, a test -- is the same run this command would make.
+
+**Exit codes say what to do next**, so a driver running many of these can act
+without parsing stderr:
+
+    0  ran
+    1  crashed -- a bug, with its traceback; never reported as missing data
+    2  usage error (argparse)
+    3  data missing: the store does not hold or cannot vouch for the window.
+       Warm the cache, then re-run
+    4  refused: a corporate action inside the window. Change the window
+    5  denied: the vendor will never serve this window. Change the window
+    6  fetch failed (only with --fetch). Transient; retry
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -31,21 +47,25 @@ from dataclasses import replace
 from pathlib import Path
 
 from vela.data.guards import CorporateActionSuspected
-from vela.data.market import MarketView
+from vela.data.market import MarketView, data_failure
 from vela.engine.loop import BacktestEngine
 from vela.engine.results import Result
-from vela.execution.fill import FillModel
 from vela.metrics.curve import curve_stats
 from vela.metrics.trades import TradeStats, trade_stats
-from vela.pricing.enrich import Enricher
-from vela.risk.margin import MaxLossMargin
-from vela.risk.sizing import FixedRisk
-from vela.run.artifacts import write_run
-from vela.strategy.gate import AlwaysOpen, Gate, IVRank
-from vela.strategy.vertical import VerticalSpread
+from vela.run.artifacts import runs_root, write_run
+from vela.run.config import DEFAULTS as D
+from vela.run.config import RunConfig
+from vela.strategy.gate import AlwaysOpen, Gate
 
 #: Haircuts probed by `--breakeven`, in half-spreads.
 _PROBES = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0)
+
+EXIT_OK = 0
+EXIT_MISSING = 3
+EXIT_REFUSED = 4
+EXIT_DENIED = 5
+EXIT_FETCH_FAILED = 6
+_EXIT_FOR = {"missing": EXIT_MISSING, "denied": EXIT_DENIED, "fetch": EXIT_FETCH_FAILED}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,55 +87,85 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-dte",
         type=int,
-        default=45,
+        default=D["max_dte"],
         help="must match the --max-dte the cache was filled with, or antlia "
         "reports the whole window uncovered",
     )
 
     shape = parser.add_argument_group("structure")
-    shape.add_argument("--right", choices=["P", "C"], default="P", help="P: credit, C: debit")
-    shape.add_argument("--moneyness", type=float, default=0.95, help="short strike / spot")
-    shape.add_argument("--width", type=float, default=5.0, help="dollars between strikes")
-    shape.add_argument("--entry-dte", type=int, nargs=2, default=[30, 45], metavar=("LO", "HI"))
+    shape.add_argument(
+        "--right", choices=["P", "C"], default=D["right"], help="P: credit, C: debit"
+    )
+    shape.add_argument(
+        "--moneyness", type=float, default=D["moneyness"], help="short strike / spot"
+    )
+    shape.add_argument("--width", type=float, default=D["width"], help="dollars between strikes")
+    shape.add_argument(
+        "--entry-dte", type=int, nargs=2, default=list(D["entry_dte"]), metavar=("LO", "HI")
+    )
 
     exits = parser.add_argument_group("exits")
-    exits.add_argument("--take-profit", type=float, default=0.5, help="fraction of max profit")
-    exits.add_argument("--stop-loss", type=float, default=0.5, help="fraction of max loss")
-    exits.add_argument("--exit-dte", type=int, default=7, help="close at this DTE; -1 to disable")
+    exits.add_argument(
+        "--take-profit", type=float, default=D["take_profit"], help="fraction of max profit"
+    )
+    exits.add_argument(
+        "--stop-loss", type=float, default=D["stop_loss"], help="fraction of max loss"
+    )
+    exits.add_argument(
+        "--exit-dte",
+        type=int,
+        default=-1 if D["exit_dte"] is None else D["exit_dte"],
+        help="close at this DTE; -1 to disable",
+    )
 
     book = parser.add_argument_group("book")
-    book.add_argument("--max-concurrent", type=int, default=3)
-    book.add_argument("--spacing", type=int, default=7, help="min days between entries")
-    book.add_argument("--cash", type=float, default=100_000.0)
-    book.add_argument("--risk", type=float, default=1_000.0, help="capital at risk per entry")
+    book.add_argument("--max-concurrent", type=int, default=D["max_concurrent"])
+    book.add_argument("--spacing", type=int, default=D["spacing"], help="min days between entries")
+    book.add_argument("--cash", type=float, default=D["cash"])
+    book.add_argument("--risk", type=float, default=D["risk"], help="capital at risk per entry")
+    book.add_argument(
+        "--cash-rate",
+        type=float,
+        default=D["cash_rate"],
+        help="annual rate cash earns (ACT/365), and the benchmark excess return "
+        "and Sharpe are measured against; default: --rate",
+    )
 
     signal = parser.add_argument_group("signal")
     signal.add_argument(
         "--iv-rank",
         type=float,
-        default=None,
+        default=D["iv_rank"],
         metavar="MIN",
         help="gate entries on ATM IV rank; omit for the no-signal null",
     )
-    signal.add_argument("--iv-lookback", type=int, default=120)
-    signal.add_argument("--iv-warmup", type=int, default=20)
+    signal.add_argument("--iv-lookback", type=int, default=D["iv_lookback"])
+    signal.add_argument("--iv-warmup", type=int, default=D["iv_warmup"])
 
     costs = parser.add_argument_group("execution")
-    costs.add_argument("--haircut", type=float, default=0.5, help="half-spreads crossed per leg")
-    costs.add_argument("--commission", type=float, default=0.65, help="dollars per contract")
+    costs.add_argument(
+        "--haircut", type=float, default=D["haircut"], help="half-spreads crossed per leg"
+    )
+    costs.add_argument(
+        "--commission", type=float, default=D["commission"], help="dollars per contract"
+    )
     costs.add_argument(
         "--blackout",
         type=float,
-        default=None,
+        default=D["blackout"],
         metavar="FRAC",
         help="do not trade on sessions whose 17:15 mid is further than this "
         "from the 16:00 close (earnings dates); omit to trade through them",
     )
-    costs.add_argument("--rate", type=float, default=0.04)
-    costs.add_argument("--dividend-yield", type=float, default=0.0)
+    costs.add_argument("--rate", type=float, default=D["rate"])
+    costs.add_argument("--dividend-yield", type=float, default=D["dividend_yield"])
 
     out = parser.add_argument_group("output")
-    out.add_argument("--out", default="runs", help="artifact root; '-' writes nothing")
+    out.add_argument(
+        "--out",
+        default=None,
+        help="artifact root; '-' writes nothing (default: $VELA_RUNS, else ~/.vela/runs)",
+    )
     out.add_argument("--label", default=None)
     out.add_argument(
         "--envelope",
@@ -136,68 +186,107 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse, then resolve the defaults that depend on other flags or the
+    environment -- here, so that `invocation` records what actually ran (the
+    rate, the directory), not None."""
     args = build_parser().parse_args(argv)
+    if args.cash_rate is None:
+        args.cash_rate = args.rate
+    if args.out is None:
+        args.out = str(runs_root())
+    return args
+
+
+def config_from(args: argparse.Namespace) -> RunConfig:
+    return RunConfig(
+        symbol=args.symbol,
+        start=args.start,
+        end=args.end,
+        as_of=_as_of(args.as_of),
+        max_dte=args.max_dte,
+        right=args.right,
+        moneyness=args.moneyness,
+        width=args.width,
+        entry_dte=(args.entry_dte[0], args.entry_dte[1]),
+        take_profit=args.take_profit,
+        stop_loss=args.stop_loss,
+        exit_dte=None if args.exit_dte < 0 else args.exit_dte,
+        max_concurrent=args.max_concurrent,
+        spacing=args.spacing,
+        cash=args.cash,
+        risk=args.risk,
+        iv_rank=args.iv_rank,
+        iv_lookback=args.iv_lookback,
+        iv_warmup=args.iv_warmup,
+        haircut=args.haircut,
+        commission=args.commission,
+        blackout=args.blackout,
+        rate=args.rate,
+        dividend_yield=args.dividend_yield,
+        cash_rate=args.cash_rate,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse(argv)
 
     if not args.fetch:
         # Provably offline: a covered read costs no vendor requests and never
         # authenticates. Set before antlia is touched.
         os.environ["ANTLIA_HISTORY_FETCH"] = "0"
 
-    enricher = Enricher(rate=args.rate, dividend_yield=args.dividend_yield)
+    config = config_from(args)
     try:
-        market = MarketView.load(
-            args.symbol,
-            args.start,
-            args.end,
-            max_dte=args.max_dte,
-            enrich=enricher,
-            as_of=_as_of(args.as_of),
-        )
+        market = config.load()
     except CorporateActionSuspected as exc:
         print(f"refusing to run:\n{exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:  # noqa: BLE001 -- antlia raises NotCovered by name
-        _explain_missing_data(args, exc)
-        return 1
+        return EXIT_REFUSED
+    except Exception as exc:
+        kind = data_failure(exc)
+        if kind is None:
+            raise  # a bug, not a data problem: exit 1 with its traceback
+        if kind == "missing":
+            _explain_missing_data(args, exc)
+        else:
+            print(f"cannot run: {exc}", file=sys.stderr)
+        return _EXIT_FOR[kind]
 
-    engine = BacktestEngine(
-        fill=FillModel(haircut=args.haircut, commission=args.commission),
-        margin=MaxLossMargin(),
-        sizing=FixedRisk(args.risk),
-        initial_cash=args.cash,
-        blackout=args.blackout,
-    )
+    engine = config.engine()
 
-    gated = _run(market, engine, args, _gate(args))
+    gated = _run(market, engine, config)
     print(_header(args, market))
     if args.iv_rank is None:
-        _report("no gate (null)", gated)
+        _report("no gate (null)", gated, args.cash_rate)
     else:
-        _report(f"IVRank(>={args.iv_rank:g})", gated)
-        _report("no gate (null)", _run(market, engine, args, AlwaysOpen()))
+        _report(f"IVRank(>={args.iv_rank:g})", gated, args.cash_rate)
+        _report("no gate (null)", _run(market, engine, config, AlwaysOpen()), args.cash_rate)
         print("\n  A gated result that does not beat its own null has shown nothing.")
 
     _report_quality(gated)
 
     if args.envelope:
-        _report_envelope(market, engine, args)
+        _report_envelope(market, engine, config)
 
     if args.breakeven:
-        _report_breakeven(market, args)
+        _report_breakeven(market, config)
 
     if args.out != "-":
-        strategy = _strategy(args, _gate(args))
+        strategy = config.strategy()
         path = write_run(
             gated,
-            Path(args.out) / args.symbol.lower(),
+            Path(args.out).expanduser() / args.symbol.lower(),
             market=market,
             engine=engine,
             strategy=strategy,
             label=args.label,
+            invocation={
+                "argv": list(sys.argv[1:] if argv is None else argv),
+                "args": vars(args),
+            },
         )
         print(f"\nartifacts: {path}")
-    return 0
+    return EXIT_OK
 
 
 # -- assembly -----------------------------------------------------------------
@@ -216,34 +305,12 @@ def _as_of(raw: str | None) -> dt.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
 
 
-def _gate(args: argparse.Namespace) -> Gate:
-    if args.iv_rank is None:
-        return AlwaysOpen()
-    return IVRank(minimum=args.iv_rank, lookback=args.iv_lookback, warmup=args.iv_warmup)
-
-
-def _strategy(args: argparse.Namespace, gate: Gate) -> VerticalSpread:
-    return VerticalSpread(
-        right=args.right,
-        moneyness=args.moneyness,
-        width=args.width,
-        entry_dte=(args.entry_dte[0], args.entry_dte[1]),
-        take_profit=args.take_profit,
-        stop_loss=args.stop_loss,
-        exit_dte=None if args.exit_dte < 0 else args.exit_dte,
-        gate=gate,
-        max_concurrent=args.max_concurrent,
-        min_days_between_entries=args.spacing,
-        tag="vertical",
-    )
-
-
 def _run(
-    market: MarketView, engine: BacktestEngine, args: argparse.Namespace, gate: Gate
+    market: MarketView, engine: BacktestEngine, config: RunConfig, gate: Gate | None = None
 ) -> Result:
     # A fresh strategy per run: a gate carries observation history that must
     # not leak between configurations.
-    return engine.run(market, _strategy(args, gate))
+    return engine.run(market, config.strategy(gate))
 
 
 # -- reporting ----------------------------------------------------------------
@@ -258,16 +325,17 @@ def _header(args: argparse.Namespace, market: MarketView) -> str:
         f"  data {market.version}\n"
         f"  {args.right} vertical, short at {args.moneyness:g}x spot, ${args.width:g} wide, "
         f"{args.entry_dte[0]}-{args.entry_dte[1]} DTE\n"
-        f"  fills cross {args.haircut:g} half-spreads at ${args.commission:g}/contract\n"
+        f"  fills cross {args.haircut:g} half-spreads at ${args.commission:g}/contract; "
+        f"cash earns {args.cash_rate:.2%}\n"
     )
 
 
-def _report(label: str, result: Result) -> None:
+def _report(label: str, result: Result, cash_rate: float) -> None:
     stats = trade_stats(result.trades)
     if stats.n == 0:
         print(f"  {label:<20} no trades")
         return
-    curve = curve_stats(result.equity, initial=result.initial_cash)
+    curve = curve_stats(result.equity, initial=result.initial_cash, risk_free=cash_rate)
     lo, hi = stats.win_rate_ci
     print(
         f"  {label:<20} n={stats.n:<3} win {stats.win_rate:>5.1%} [{lo:.2f},{hi:.2f}]  "
@@ -278,6 +346,12 @@ def _report(label: str, result: Result) -> None:
         f"  {'':<20} gross ${stats.gross_pnl:>9,.0f}  spread ${-stats.costs.spread:>9,.0f}  "
         f"commission ${-stats.costs.commission:>7,.0f}   {_verdict(stats)}"
     )
+    sharpe = "n/a" if math.isnan(curve.sharpe) else f"{curve.sharpe:.2f}"
+    print(
+        f"  {'':<20} account {curve.total_return:>+6.2%}  cash alone "
+        f"{curve.risk_free_return:>+6.2%}  excess {curve.excess_return:>+6.2%}  "
+        f"interest ${result.interest:>7,.0f}  sharpe {sharpe}"
+    )
 
 
 def _verdict(stats: TradeStats) -> str:
@@ -286,7 +360,7 @@ def _verdict(stats: TradeStats) -> str:
     return "significant" if stats.significant else "indistinguishable from zero"
 
 
-def _report_envelope(market: MarketView, engine: BacktestEngine, args: argparse.Namespace) -> None:
+def _report_envelope(market: MarketView, engine: BacktestEngine, config: RunConfig) -> None:
     """Two runs bracketing the answer EOD data cannot give.
 
     A stop is path-dependent and a daily bar has no path, so close-only
@@ -294,10 +368,8 @@ def _report_envelope(market: MarketView, engine: BacktestEngine, args: argparse.
     never be ranked against each other -- **the width between them is the
     finding**. Narrow means EOD granularity is not what limits this result.
     """
-    optimistic = trade_stats(_run(market, engine, args, _gate(args)).trades)
-    pessimistic = trade_stats(
-        _run(market, replace(engine, intraday_stop=True), args, _gate(args)).trades
-    )
+    optimistic = trade_stats(_run(market, engine, config).trades)
+    pessimistic = trade_stats(_run(market, replace(engine, intraday_stop=True), config).trades)
     band = pessimistic.total_pnl - optimistic.total_pnl
     print("\n  envelope (a bound each, never a ranking):")
     for label, stats in (
@@ -336,7 +408,7 @@ def _report_quality(result: Result) -> None:
         )
 
 
-def _report_breakeven(market: MarketView, args: argparse.Namespace) -> None:
+def _report_breakeven(market: MarketView, config: RunConfig) -> None:
     """The haircut at which this configuration stops making money.
 
     More informative than the P&L at one assumed haircut, because the
@@ -347,14 +419,7 @@ def _report_breakeven(market: MarketView, args: argparse.Namespace) -> None:
     print("\n  break-even haircut (half-spreads crossed per leg):")
     results = []
     for haircut in _PROBES:
-        engine = BacktestEngine(
-            fill=FillModel(haircut=haircut, commission=args.commission),
-            margin=MaxLossMargin(),
-            sizing=FixedRisk(args.risk),
-            initial_cash=args.cash,
-            blackout=args.blackout,
-        )
-        stats = trade_stats(_run(market, engine, args, _gate(args)).trades)
+        stats = trade_stats(_run(market, config.engine(haircut=haircut), config).trades)
         results.append((haircut, stats.total_pnl))
         print(f"    {haircut:>5.2f}   ${stats.total_pnl:>10,.0f}")
 

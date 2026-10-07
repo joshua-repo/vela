@@ -26,6 +26,11 @@ are assigned on the evening of session D and find out on the morning of D+1,
 so a strategy that closed the position during D was never assigned at all.
 Checking earlier would take away a decision the trader really had.
 
+**Interest accrues first**, for the calendar days since the previous session,
+on the cash the book held overnight. The strategy then sees the balance it
+would see at a broker in the morning. Nothing accrues on the first session:
+the account is funded that day.
+
 **A blacked-out session still calls the strategy.** `blackout` suppresses the
 *orders*, not the call: a gate maintaining its own history has to advance on
 days it cannot trade, or its range is computed only from the days it happened
@@ -80,6 +85,12 @@ class BacktestEngine:
     margin: MarginModel = field(default_factory=NoMargin)
     sizing: SizingModel = field(default_factory=FixedUnits)
     initial_cash: float = 100_000.0
+    #: Annual rate cash earns, ACT/365 -- see `Book.accrue`. It is also the
+    #: benchmark: a result's excess return is measured against this account
+    #: left in cash. Zero here so that hand-computed tests stay exact; the CLI
+    #: defaults it to the pricing rate, because a backtest that pays no carry
+    #: compares every strategy against a cash account that earns nothing.
+    cash_rate: float = 0.0
     multiplier: int = MULTIPLIER
 
     def run(
@@ -111,7 +122,12 @@ class BacktestEngine:
             else set()
         )
 
+        interest = 0.0
+        previous: dt.date | None = None
         for day in sessions:
+            if previous is not None and self.cash_rate:
+                interest += book.accrue(self.cash_rate, (day - previous).days)
+            previous = day
             chain = market.chain(day)
             spot = market.bar(day).close
             if not len(chain):
@@ -182,6 +198,7 @@ class BacktestEngine:
                     realised=realised,
                     unrealised=book.unrealised(chain, spot, self.fill),
                     open_positions=len(book),
+                    interest=interest,
                 )
             )
 

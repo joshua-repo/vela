@@ -9,6 +9,16 @@ invariant
 is checkable **from the result alone**, for every day of the run, without
 re-running anything. An invariant you can only assert from inside the loop is
 an invariant nobody checks.
+
+Interest on cash is the one movement no position explains, so it is carried
+as its own running total and the invariant names it:
+
+    equity - initial_cash == realised + unrealised + interest
+
+It is account-level on purpose. No `Trade` carries it: a position's P&L is
+what the position did, and the carry is what the account would have earned
+holding nothing at all -- which is exactly the benchmark a result is read
+against.
 """
 
 from __future__ import annotations
@@ -76,6 +86,8 @@ class EquityPoint:
     realised: float
     unrealised: float
     open_positions: int
+    #: Interest credited to cash so far, cumulative like `realised`.
+    interest: float = 0.0
 
     @property
     def equity(self) -> float:
@@ -155,6 +167,11 @@ class Result:
         return sum(t.pnl for t in self.trades)
 
     @property
+    def interest(self) -> float:
+        """Interest the account earned on its cash. Part of `total_pnl`."""
+        return self.equity[-1].interest if self.equity else 0.0
+
+    @property
     def costs(self) -> Costs:
         """What execution took across every closed trade."""
         total = Costs()
@@ -169,7 +186,7 @@ class Result:
         return sum(t.pnl > 0 for t in self.trades) / len(self.trades)
 
     def invariant_breaks(self, tolerance: float = 1e-6) -> list[EquityPoint]:
-        """Sessions where `equity - initial != realised + unrealised`.
+        """Sessions where `equity - initial != realised + unrealised + interest`.
 
         Empty is the only acceptable answer. A break means cash moved without
         a position explaining it, which is the failure mode a backtest hides
@@ -178,7 +195,10 @@ class Result:
         return [
             point
             for point in self.equity
-            if abs((point.equity - self.initial_cash) - (point.realised + point.unrealised))
+            if abs(
+                (point.equity - self.initial_cash)
+                - (point.realised + point.unrealised + point.interest)
+            )
             > tolerance
         ]
 

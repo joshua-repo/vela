@@ -13,15 +13,19 @@ to know each strategy's column set; one built on the summary does not.
 
 Runs are **append-only**. A run directory is stamped with the moment it ran
 and never overwritten, because a result whose inputs you can no longer
-reconstruct is not evidence of anything.
+reconstruct is not evidence of anything. Two runs that finish in the same
+second with the same label -- which is the normal case for parallel cells --
+get `-1`, `-2` suffixes; `mkdir` is atomic, so no lock is needed.
 """
 
 from __future__ import annotations
 
 import csv
 import datetime as dt
+import itertools
 import json
 import math
+import os
 import subprocess
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
@@ -63,6 +67,7 @@ EQUITY_COLUMNS = (
     "realised",
     "unrealised",
     "open_positions",
+    "interest",
 )
 
 
@@ -74,17 +79,20 @@ def write_run(
     engine: BacktestEngine,
     strategy: Strategy,
     label: str | None = None,
+    invocation: dict[str, Any] | None = None,
 ) -> Path:
     """Write one run under `directory`, returning the directory it created."""
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = _stamp()
     name = f"{stamp}_{label}" if label else stamp
-    out = Path(directory) / name
-    out.mkdir(parents=True, exist_ok=False)
+    out = _claim(Path(directory), name)
 
     _write_trades(result, out / "trades.csv")
     _write_equity(result, out / "equity.csv")
     (out / "summary.json").write_text(
-        json.dumps(summary(result, market=market, engine=engine, strategy=strategy), indent=2)
+        json.dumps(
+            summary(result, market=market, engine=engine, strategy=strategy, invocation=invocation),
+            indent=2,
+        )
         + "\n"
     )
     return out
@@ -96,11 +104,22 @@ def summary(
     market: MarketView,
     engine: BacktestEngine,
     strategy: Strategy,
+    invocation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The provenance record: what ran, over what, and what came out."""
+    """The provenance record: what ran, over what, and what came out.
+
+    `invocation` is how the run was asked for -- the command line and every
+    parsed argument, defaults included. The rest of the record describes the
+    objects that ran, which is not the same thing: `--rate`, `--max-dte` and
+    `--as-of` change the result without surfacing on any of them. A reader
+    that needs to know whether two runs differ in exactly one input compares
+    these. Absent, not empty, when a caller built the run without a CLI.
+    """
     trades = trade_stats(result.trades)
     curve = (
-        curve_stats(result.equity, initial=result.initial_cash) if len(result.equity) > 1 else None
+        curve_stats(result.equity, initial=result.initial_cash, risk_free=engine.cash_rate)
+        if len(result.equity) > 1
+        else None
     )
     declines: dict[str, int] = {}
     for decline in result.declined:
@@ -116,9 +135,18 @@ def summary(
             "start": result.equity[0].date if result.equity else None,
             "end": result.equity[-1].date if result.equity else None,
             "sessions": len(result.equity),
+            # The regime in one number: first to last close over the window.
+            # A result has to be read beside it -- selling puts through a
+            # rising market says little about selling puts.
+            "underlying_move": (
+                result.equity[-1].spot / result.equity[0].spot - 1
+                if len(result.equity) > 1 and result.equity[0].spot
+                else None
+            ),
         },
         "engine": {
             "initial_cash": engine.initial_cash,
+            "cash_rate": engine.cash_rate,
             "multiplier": engine.multiplier,
             "fill": _params(engine.fill),
             "assignment": _params(engine.assignment),
@@ -129,10 +157,15 @@ def summary(
         "results": {
             "trades": asdict(trades),
             "curve": asdict(curve) if curve else None,
+            # Account-level: no trade carries it, and `curve` measures the
+            # excess over it.
+            "interest": result.interest,
             "open_at_end": len(result.open_at_end),
             "declined": declines,
         },
     }
+    if invocation is not None:
+        record["invocation"] = invocation
     cleaned: dict[str, Any] = _clean(record)
     return cleaned
 
@@ -184,6 +217,7 @@ def _write_equity(result: Result, path: Path) -> None:
                     "realised": round(point.realised, 4),
                     "unrealised": round(point.unrealised, 4),
                     "open_positions": point.open_positions,
+                    "interest": round(point.interest, 4),
                 }
             )
 
@@ -213,21 +247,66 @@ def _is_component(value: object) -> bool:
     return not isinstance(value, (str, bytes, int, float, bool, type(None), list, tuple, dict))
 
 
+#: Overrides the default runs root. `--out` overrides both.
+RUNS_ENV = "VELA_RUNS"
+
+
+def runs_root() -> Path:
+    """Where runs land when nobody says otherwise: `$VELA_RUNS`, else
+    `~/.vela/runs`.
+
+    Fixed rather than relative to the working directory, because pictor reads
+    this folder and cannot follow a result to wherever its runner happened to
+    stand -- the same reason antlia keeps its store at `~/.antlia/store`.
+    """
+    raw = os.environ.get(RUNS_ENV)
+    return Path(raw).expanduser() if raw else Path.home() / ".vela" / "runs"
+
+
+def _stamp() -> str:
+    return dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _claim(directory: Path, name: str) -> Path:
+    """Create a fresh run directory, suffixing `name` until one is free."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for attempt in itertools.count():
+        out = directory / (name if attempt == 0 else f"{name}-{attempt}")
+        try:
+            out.mkdir()
+        except FileExistsError:
+            continue
+        return out
+    raise AssertionError("unreachable")
+
+
+#: Where vela's own source lives. git is asked about *this* checkout, not the
+#: caller's working directory: a driver launching cells from another repo
+#: would otherwise stamp every result with the driver's commit.
+_SOURCE = Path(__file__).resolve().parent
+
+
 def _git() -> dict[str, Any]:
     """The commit a run was produced at, and whether the tree was dirty.
 
     A dirty tree is recorded rather than refused: research happens on dirty
-    trees. What matters is that the result says so.
+    trees. What matters is that the result says so. An install that is not a
+    checkout records nulls rather than whatever repository surrounds it.
     """
-    try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], capture_output=True, text=True, check=True, cwd=_SOURCE
         ).stdout.strip()
-        dirty = bool(
-            subprocess.run(
-                ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
-            ).stdout.strip()
-        )
+
+    try:
+        # Installed into another project's venv, the nearest repository is that
+        # project's. Only a checkout whose src/vela is this package counts.
+        top = Path(git("rev-parse", "--show-toplevel")).resolve()
+        if top / "src" / "vela" != _SOURCE.parent:
+            return {"sha": None, "dirty": None}
+        sha = git("rev-parse", "HEAD")
+        dirty = bool(git("status", "--porcelain"))
         return {"sha": sha, "dirty": dirty}
     except (subprocess.CalledProcessError, FileNotFoundError):
         return {"sha": None, "dirty": None}
