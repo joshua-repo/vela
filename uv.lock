@@ -22,6 +22,7 @@ source = { directory = "../antlia" }
 store = [
     { name = "duckdb" },
     { name = "pyarrow" },
+    { name = "pytz" },
 ]
 thetadata = [
     { name = "python-dotenv" },
@@ -34,9 +35,12 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'trading212'", specifier = ">=0.27" },
     { name = "ib-insync", marker = "extra == 'ibkr'", specifier = ">=0.9.86" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.2" },
+    { name = "polars", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pyarrow", marker = "extra == 'store'", specifier = ">=16" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "python-dotenv", marker = "extra == 'thetadata'", specifier = ">=1.0" },
+    { name = "pytz", marker = "extra == 'store'", specifier = ">=2024.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "thetadata", marker = "extra == 'thetadata'", specifier = ">=1.0" },
     { name = "tzdata", marker = "extra == 'ibkr'", specifier = ">=2024.1" },
